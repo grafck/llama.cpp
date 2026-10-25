@@ -571,55 +571,109 @@ static void ggml_kunlun_mul_mat(ggml_backend_kunlun_context * bctx, ggml_tensor 
     }
 }
 
-static void ggml_kunlun_set_rows(ggml_backend_kunlun_context * bctx, ggml_tensor * dst) {
-    // dst[positions[i]] = src0[i] - KV append via H2D copies to row offsets (PROGRAM.md design).
-    // src0 may be fp32 while the cache is fp16: convert on host like ggml's SET_ROWS does.
-    const ggml_tensor * src0 = dst->src[0];  // new rows
-    const ggml_tensor * src1 = dst->src[1];  // int32 positions
+static void ggml_kunlun_set_rows(ggml_backend_kunlun_context * bctx, ggml_tensor * op) {
+    // mirror ggml_compute_forward_set_rows_impl exactly:
+    //   for i03, i02, i:  i1 = src1[i][i02%ne11][i03%ne12];
+    //     dst->data + i1*nb1 + i02*nb2 + i03*nb3  <-  src0->data + i*nb01 + i02*nb02 + i03*nb03
+    // src0 = new rows (b), src1 = idx (c, i32/i64), dst = view of the cache tensor (a).
+    const ggml_tensor * src0 = op->src[0];
+    const ggml_tensor * src1 = op->src[1];
+    ggml_tensor *       dst  = op;
 
-    const int64_t n_rows   = src1->ne[0];
-    const int64_t ne_row   = dst->ne[0];
-    const size_t  row_out  = ggml_row_size(dst->type, ne_row);
-    const size_t  row_in   = ggml_row_size(src0->type, src0->ne[0]);
+    const int64_t nc     = src0->ne[0];
+    const int64_t n_rows = src0->ne[1];
 
-    std::vector<int32_t> pos(n_rows);
-    ggml_backend_tensor_get(src1, pos.data(), 0, n_rows * sizeof(int32_t));
+    const size_t row_out = ggml_row_size(dst->type, nc);
+    const size_t row_in  = ggml_row_size(src0->type, nc);
+
+    const bool idx64 = src1->type == GGML_TYPE_I64;
+    const size_t idx_sz = idx64 ? 8 : 4;
 
     ggml_kunlun_device * dev = kunlun_device(bctx->dev_index);
     kunlun_dev_guard guard(dev->index);
 
-    std::vector<char> stage_in;
-    if (src0->type != dst->type) {
-        stage_in.resize(row_in);
-    }
-    bctx->stage.resize(row_out);
-
-    const struct ggml_type_traits * tt = ggml_get_type_traits(dst->type);
-    GGML_ASSERT(tt->from_float_ref || src0->type == dst->type);
-
-    const size_t dst_stride = dst->nb[1];
-    const size_t src_stride = src0->nb[1];
-    for (int64_t i = 0; i < n_rows; i++) {
-        GGML_ASSERT(pos[i] >= 0 && (int64_t) pos[i] < dst->ne[1]);
-        void * dst_stage = bctx->stage.data();
-        if (src0->type != dst->type) {
-            ggml_backend_tensor_get(src0, stage_in.data(), (size_t) i * src_stride, row_in);
-            if (src0->type == GGML_TYPE_F32) {
-                tt->from_float_ref((const float *) stage_in.data(), dst_stage, (int32_t) ne_row);
+    // fetch idx wholesale (it is small)
+    const int64_t idx_count = src1->ne[0] * src1->ne[1] * src1->ne[2];
+    std::vector<int64_t> idx((size_t) idx_count);
+    {
+        kunlun_dev_guard g2(bctx->dev_index);
+        // idx may live on any buffer (incl. host): use the generic tensor accessor
+        if (src1->buffer) {
+            if (idx64) {
+                ggml_backend_tensor_get(src1, idx.data(), 0, idx_count * 8);
             } else {
-                const struct ggml_type_traits * tt_in = ggml_get_type_traits(src0->type);
-                GGML_ASSERT(tt_in->to_float && tt->from_float_ref);
-                std::vector<float> tmp(ne_row);
-                tt_in->to_float(stage_in.data(), tmp.data(), (int32_t) ne_row);
-                tt->from_float_ref(tmp.data(), dst_stage, (int32_t) ne_row);
+                std::vector<int32_t> i32((size_t) idx_count);
+                ggml_backend_tensor_get(src1, i32.data(), 0, idx_count * 4);
+                for (int64_t k = 0; k < idx_count; k++) idx[(size_t) k] = i32[(size_t) k];
             }
         } else {
-            ggml_backend_tensor_get(src0, dst_stage, (size_t) i * src_stride, row_out);
+            GGML_ASSERT(src1->data);
+            for (int64_t k = 0; k < idx_count; k++) {
+                idx[(size_t) k] = idx64 ? ((const int64_t *) src1->data)[k]
+                                        : ((const int32_t *) src1->data)[k];
+            }
         }
-        xpu_wait();  // dst row may hold output of queued compute
-        int rc = xpu_memcpy((char *) dst->data + (size_t) pos[i] * dst_stride,
-                            dst_stage, row_out, XPU_HOST_TO_DEVICE);
-        GGML_ASSERT(rc == 0);
+    }
+    auto idx_at = [&](int64_t i, int64_t i11, int64_t i12) -> int64_t {
+        return idx[(size_t) (i * src1->nb[0] / (int64_t) idx_sz
+                           + i11 * src1->nb[1] / (int64_t) idx_sz
+                           + i12 * src1->nb[2] / (int64_t) idx_sz)];
+    };
+
+    const struct ggml_type_traits * tt = ggml_get_type_traits(dst->type);
+    const bool cast = src0->type != dst->type;
+    if (cast) {
+        GGML_ASSERT(tt->from_float_ref && (src0->type == GGML_TYPE_F32 || src0->type == GGML_TYPE_F16));
+    }
+
+    std::vector<char> stage_in;
+    if (cast) {
+        stage_in.resize(row_in);
+    }
+    bctx->stage.resize(std::max(row_out, row_in));
+    xpu_wait();  // dst rows may hold output of queued compute before H2D overwrite
+
+    for (int64_t i03 = 0; i03 < src0->ne[3]; ++i03) {
+        for (int64_t i02 = 0; i02 < src0->ne[2]; ++i02) {
+            const int64_t i11 = i02 % src1->ne[1];
+            const int64_t i12 = i03 % src1->ne[2];
+            for (int64_t i = 0; i < n_rows; ++i) {
+                const int64_t i1 = idx_at(i, i11, i12);
+                GGML_ASSERT(i1 >= 0 && i1 < dst->ne[1]);
+
+                char * dst_stage = bctx->stage.data();
+                char * dst_ptr = (char *) dst->data + i1 * dst->nb[1]
+                               + i02 * dst->nb[2] + i03 * dst->nb[3];
+                const size_t src_off = (size_t) (i * src0->nb[1] + i02 * src0->nb[2] + i03 * src0->nb[3]);
+
+                // src0 may live on a device buffer (fetch) or in plain host memory (direct)
+                auto fetch_row = [&](char * to) {
+                    if (src0->buffer) {
+                        ggml_backend_tensor_get(src0, to, src_off, row_in);
+                    } else {
+                        GGML_ASSERT(src0->data);
+                        std::memcpy(to, (const char *) src0->data + src_off, row_in);
+                    }
+                };
+
+                if (!cast) {
+                    fetch_row(dst_stage);
+                    int rc = xpu_memcpy(dst_ptr, dst_stage, row_out, XPU_HOST_TO_DEVICE);
+                    GGML_ASSERT(rc == 0);
+                } else {
+                    fetch_row(stage_in.data());
+                    if (src0->type == GGML_TYPE_F32) {
+                        tt->from_float_ref((const float *) stage_in.data(), dst_stage, (int32_t) nc);
+                    } else {
+                        std::vector<float> tmp((size_t) nc);
+                        ggml_fp16_to_fp32_row((const ggml_fp16_t *) stage_in.data(), tmp.data(), (int32_t) nc);
+                        tt->from_float_ref(tmp.data(), dst_stage, (int32_t) nc);
+                    }
+                    int rc = xpu_memcpy(dst_ptr, dst_stage, row_out, XPU_HOST_TO_DEVICE);
+                    GGML_ASSERT(rc == 0);
+                }
+            }
+        }
     }
     xpu_wait();
 }
@@ -809,17 +863,27 @@ static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const
         }
 
         case GGML_OP_SET_ROWS: {
-            const ggml_tensor * src0 = op->src[0];
-            // dst (KV cache) must be on THIS kunlun device when known (NULL = pre-allocation probe)
+            const ggml_tensor * src0 = op->src[0];  // new rows (b)
+            const ggml_tensor * src1 = op->src[1];  // idx (c)
+            // dst (KV cache view) must target THIS kunlun device when known (NULL = pre-allocation probe)
             const ggml_tensor * dst_buf_src = op->view_src ? op->view_src : op;
             if (dst_buf_src->buffer &&
                 !ggml_backend_buft_is_kunlun_buft(ggml_backend_buffer_get_type(dst_buf_src->buffer), dev_index)) {
                 return false;
             }
-            if (op->nb[1] != (int64_t) ggml_row_size(op->type, op->ne[0])) {
+            if (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64) {
                 return false;
             }
-            if (src0->nb[0] != (int64_t) ggml_type_size(src0->type)) {
+            // ggml_set_rows construction contract
+            if (src0->ne[1] != src1->ne[0] ||
+                src0->ne[2] % src1->ne[1] != 0 ||
+                src0->ne[3] % src1->ne[2] != 0 ||
+                src1->ne[3] != 1) {
+                return false;
+            }
+            // eval uses row strides directly: rows contiguous, cache rows packed
+            if (src0->nb[0] != (int64_t) ggml_type_size(src0->type) ||
+                op->nb[1] != (int64_t) ggml_row_size(op->type, op->ne[0])) {
                 return false;
             }
             if (src0->ne[0] != op->ne[0]) {
@@ -832,7 +896,6 @@ static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const
             if (src0->type != GGML_TYPE_F16 && src0->type != GGML_TYPE_F32) {
                 return false;
             }
-            fprintf(stderr, "KSETROWS accept\n");
             return true;
         }
 
