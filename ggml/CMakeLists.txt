@@ -278,6 +278,8 @@ set   (GGML_VULKAN_SHADERS_GEN_TOOLCHAIN "" CACHE FILEPATH "ggml: toolchain file
 option(GGML_ZENDNN                          "ggml: use ZenDNN"                                OFF)
 option(ZENDNN_ROOT                          "ggml: path to ZenDNN installation"               "")
 
+option(GGML_KUNLUN                          "ggml: use Kunlun XPU (K200/KL1) backend"         OFF)
+
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
 option(GGML_BUILD_EXAMPLES "ggml: build examples" ${GGML_STANDALONE})

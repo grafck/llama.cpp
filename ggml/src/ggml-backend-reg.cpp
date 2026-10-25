@@ -86,6 +86,10 @@
 #include "ggml-openvino.h"
 #endif
 
+#ifdef GGML_USE_KUNLUN
+#include "ggml-kunlun.h"
+#endif
+
 #ifdef GGML_USE_ET
 #include "ggml-et.h"
 #endif
@@ -164,6 +168,9 @@ struct ggml_backend_registry {
 #endif
 #ifdef GGML_USE_OPENVINO
         register_backend(ggml_backend_openvino_reg());
+#endif
+#ifdef GGML_USE_KUNLUN
+        register_backend(ggml_backend_kunlun_reg());
 #endif
 #ifdef GGML_USE_ET
         register_backend(ggml_backend_et_reg());
