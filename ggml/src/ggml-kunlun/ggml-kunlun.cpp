@@ -489,6 +489,10 @@ static void ggml_kunlun_mul_mat(ggml_backend_kunlun_context * bctx, ggml_tensor 
     const int64_t nn = ne01;                 // output features
     const int64_t m  = ne11 * ne12 * ne13;  // flattened rows (src0 ne02==ne03==1 checked in supports_op)
 
+    if (m == 0) {
+        return;  // empty batch (end of prompt stream) - nothing to compute, fc rejects m=0
+    }
+
     void * w16 = kunlun_weights_get(src0, dev);
     GGML_ASSERT(w16 && "weight conversion failed");
 
@@ -541,6 +545,13 @@ static void ggml_kunlun_mul_mat(ggml_backend_kunlun_context * bctx, ggml_tensor 
 
     int rc = xdnn::fc<f16, f16, f16, short>(ctx, (const f16 *) bctx->x16_dev, (const f16 *) w16,
                                             (f16 *) y16, m, nn, nk, false, true, nullptr, nullptr, nullptr);
+    if (rc != 0) {
+        KUNLUN_LOG_ERR("fc rc=%d w=%s m=%lld nn=%lld nk=%lld src1 t=%d ne=[%lld,%lld,%lld,%lld] nb=[%lld,%lld,%lld,%lld] dst t=%d contig=%d",
+            rc, src0->name, (long long) m, (long long) nn, (long long) nk,
+            (int) src1->type, (long long) src1->ne[0], (long long) src1->ne[1], (long long) src1->ne[2], (long long) src1->ne[3],
+            (long long) src1->nb[0], (long long) src1->nb[1], (long long) src1->nb[2], (long long) src1->nb[3],
+            (int) dst->type, (int) ggml_is_contiguous(dst));
+    }
     xpu_wait();
     GGML_ASSERT(rc == 0 && "kunlun fc failed");
 
