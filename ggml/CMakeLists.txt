@@ -260,6 +260,7 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
                                             "ggml: sycl device architecture")
 
 option(GGML_OPENVINO                        "ggml: use OPENVINO"                              OFF)
+option(GGML_KUNLUN                          "ggml: use Kunlun K200 (KL1)"                     OFF)
 option(GGML_ET                              "ggml: use ET backend"                            OFF)
 option(GGML_ET_SYSEMU                       "ggml: use ET backend via sysemu"                 OFF)
 
