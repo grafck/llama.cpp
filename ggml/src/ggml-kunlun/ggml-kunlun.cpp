@@ -632,6 +632,97 @@ static ggml_backend_buffer_type_t ggml_backend_kunlun_device_get_buffer_type(ggm
     return &g_kunlun_buft[idx];
 }
 
+// row element-type pairs the SET_ROWS write path can convert per row
+// (mirrors ggml_backend_kunlun_convert_row exactly)
+static bool ggml_backend_kunlun_row_type_convertible(enum ggml_type from, enum ggml_type to) {
+    if (from == to) {
+        return true;
+    }
+    if (from == GGML_TYPE_F32) {
+        return to == GGML_TYPE_F16 || to == GGML_TYPE_BF16;
+    }
+    if (from == GGML_TYPE_F16) {
+        return to == GGML_TYPE_F32;
+    }
+    return false;
+}
+
+// full ggml_set_rows contract validation for the 4D device write path above.
+//
+// this fork's ggml_set_rows (ggml/src/ggml.c) lays the node out as:
+//   node    = destination cache, a view of src[2] (the dst operand)
+//   src[0]  = values rows   (b)
+//   src[1]  = row indices   (c)
+// and asserts in the builder + ggml_compute_forward_set_rows_impl (ggml-cpu/ops.cpp):
+//   values is F32/F16, idx is I32/I64, values and cache element types are
+//   row-convertible by this kernel;
+//   cache ne[0]/ne[2]/ne[3] equal values ne[0]/ne[2]/ne[3];
+//   values ne[1] == idx ne[0]; idx ne[3] == 1;
+//   values ne[2] % idx ne[1] == 0 and values ne[3] % idx ne[2] == 0
+//   (idx dims broadcast over the values planes; zero idx dims are rejected before
+//    the modulo because % 0 is UB, the CPU impl would crash there too);
+//   values and cache rows are contiguous in memory (ggml_is_contiguous_rows, the
+//    builder asserts it for both operands).
+// buffer policy: the cache (node itself or any view of it) must resolve to Kunlun
+// device memory; values and idx tolerate NULL buffers (probes before allocation,
+// ggml_set_no_alloc contexts) and host buffers alike - the write path memcpys
+// host rows and the scheduler inserts H2D copies for the device-resident cases.
+static bool ggml_backend_kunlun_device_supports_set_rows(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    GGML_UNUSED(dev);
+
+    const ggml_tensor * values = op->src[0];
+    const ggml_tensor * idx    = op->src[1];
+
+    if (!values || !idx) {
+        return false;
+    }
+
+    // destination must resolve to this backend's device memory (KV slices are views)
+    if (!ggml_backend_buffer_is_kunlun_deep(op)) {
+        return false;
+    }
+
+    // row indices must be I32 or I64
+    if (idx->type != GGML_TYPE_I32 && idx->type != GGML_TYPE_I64) {
+        return false;
+    }
+
+    // values rows: F32/F16 per the CPU impl contract
+    if (values->type != GGML_TYPE_F32 && values->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    // cache/values element-type pair must be one the kernel can convert per row
+    if (!ggml_backend_kunlun_row_type_convertible(values->type, op->type)) {
+        return false;
+    }
+
+    // required ne relations: values and cache agree on row width and planes
+    if (op->ne[0] != values->ne[0] ||
+        op->ne[2] != values->ne[2] ||
+        op->ne[3] != values->ne[3]) {
+        return false;
+    }
+    // one row index per values row
+    if (values->ne[1] != idx->ne[0]) {
+        return false;
+    }
+    // idx dims broadcast over the values planes; idx is at most 3D
+    if (idx->ne[3] != 1 ||
+        idx->ne[1] == 0 || idx->ne[2] == 0 ||
+        values->ne[2] % idx->ne[1] != 0 ||
+        values->ne[3] % idx->ne[2] != 0) {
+        return false;
+    }
+
+    // row strides: cache and values rows must be contiguous
+    if (!ggml_is_contiguous_rows(op) || !ggml_is_contiguous_rows(values)) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
     switch (op->op) {
@@ -639,10 +730,9 @@ static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_CONT:
             return ggml_backend_buffer_is_kunlun(op->src[0]) && ggml_backend_buffer_is_kunlun(op);
         case GGML_OP_SET_ROWS:
-            // routing only: the node is a KV cache (or a view of it); full ggml_set_rows
-            // contract validation (idx dtype, ne relations, row strides) is enforced
-            // defensively in graph_compute and refined by the supports_op card.
-            return ggml_backend_buffer_is_kunlun_deep(op);
+            // full ggml_set_rows contract validation (replaces the routing-only case
+            // left by the write-path card; graph_compute keeps its runtime guards)
+            return ggml_backend_kunlun_device_supports_set_rows(dev, op);
         default:
             return false;
     }
