@@ -15,6 +15,10 @@
 #include "ggml-impl.h"
 
 #include <xpu/runtime.h>
+#include <xpu/xdnn.h>
+
+namespace xdnn = baidu::xpu::api;
+using f16_kunlun = float16;
 
 #include <atomic>
 #include <cstdio>
@@ -22,6 +26,7 @@
 #include <cstring>
 #include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define GGML_KUNLUN_MAX_ALLOC  ((4ull << 30) - (128ull << 20))  // 4.0 GB ok, 4.5 GB fails (measured)
@@ -55,6 +60,7 @@ struct ggml_backend_kunlun_device_context {
     std::string  name;
     std::string  description;
     std::string  pci_id;
+    xdnn::Context * xdnn_ctx = nullptr;  // eager op context, created once per PD
 };
 
 static std::vector<ggml_backend_device>      g_kunlun_devices;
@@ -64,6 +70,122 @@ static int                                   g_kunlun_n_dev = 0;
 
 // serializes all device calls: xpu_set_device is thread-local
 static std::mutex                            g_kunlun_mutex;
+
+// ---------------------------------------------------------------------------
+// fp16 weight registry
+//
+// MUL_MAT weights are kept as f16 device buffers. An f16 weight tensor is
+// aliased: the registry hands out tensor->data itself, no copy, no conversion
+// (ggml [k rows, n cols] packed rows are exactly the [n x k] row-major layout
+// that xdnn fc wants with w_trans=true). An f32 weight tensor gets a lazy
+// on-device cast<float,f16> at first use; the result lives in tensor->extra
+// and is reused by every later MUL_MAT that sees the same tensor.
+//
+// tensor->extra is the authoritative hit marker (a fresh tensor starts with
+// extra = NULL, so a reused device address never aliases a dead tensor's
+// f16 copy). The map below is the ownership registry: it lets a conversion
+// overwrite free the dead entry at the same address and lets free_buffer
+// sweep entries whose weight buffer is going away.
+
+struct kunlun_f16_weight {
+    void *  dev_f16;   // f16 device bytes for fc
+    int     device;
+    size_t  nbytes;    // f16 bytes, for memory accounting
+    bool    owned;     // allocated by the registry (f32->f16), else aliased
+};
+
+// key: device address of the f32 weight tensor
+static std::unordered_map<const void *, kunlun_f16_weight *> g_f16_registry;
+static std::atomic<uint64_t> g_f16_conversions{0};
+
+static ggml_backend_kunlun_device_context * kunlun_device_ctx(int device) {
+    if (device < 0 || device >= (int) g_kunlun_devices.size()) {
+        return nullptr;
+    }
+    return (ggml_backend_kunlun_device_context *) g_kunlun_devices[device].context;
+}
+
+// free an owned conversion and drop it from the registry (key = weight addr).
+// caller must hold g_kunlun_mutex and have the target device selected.
+static void kunlun_f16_weight_release(const ggml_tensor * w, kunlun_f16_weight * we) {
+    if (!we->owned) {
+        return;
+    }
+    xpu_wait();  // queued kernels may still read this buffer
+    xpu_free(we->dev_f16);
+    if (kunlun_device_ctx(we->device)) {
+        kunlun_device_ctx(we->device)->allocated -= we->nbytes;
+    }
+    if (w && w->extra == we) {
+        w->extra = nullptr;
+    }
+    auto it = g_f16_registry.find(w ? w->data : nullptr);
+    if (it != g_f16_registry.end() && it->second == we) {
+        g_f16_registry.erase(it);
+    }
+    delete we;
+}
+
+// drop every registry entry whose weight lives inside a buffer being freed.
+// caller must hold g_kunlun_mutex and have the device selected.
+static void kunlun_registry_sweep(uintptr_t base, size_t size) {
+    for (auto it = g_f16_registry.begin(); it != g_f16_registry.end();) {
+        const uintptr_t addr = (uintptr_t) it->first;
+        if (addr >= base && addr < base + size) {
+            kunlun_f16_weight * we = it->second;
+            if (we->owned && kunlun_device_ctx(we->device)) {
+                kunlun_device_ctx(we->device)->allocated -= we->nbytes;
+            }
+            if (we->owned) {
+                xpu_free(we->dev_f16);
+            }
+            delete we;
+            it = g_f16_registry.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// f32 -> f16 on device; caller holds g_kunlun_mutex, device selected
+static kunlun_f16_weight * kunlun_f32_to_f16(const ggml_tensor * w,
+                                             ggml_backend_kunlun_device_context * ctx,
+                                             xdnn::Context * xdnn_ctx) {
+    const int64_t n_elts = ggml_nelements(w);
+    const size_t   n_f16 = (size_t) n_elts * sizeof(f16_kunlun);
+
+    kunlun_f16_weight * we = new kunlun_f16_weight();
+    we->device = ctx->device;
+    we->nbytes = n_f16;
+    we->owned  = true;
+
+    if (n_f16 > GGML_KUNLUN_MAX_ALLOC || ctx->total - ctx->allocated < n_f16) {
+        delete we;
+        return nullptr;
+    }
+    if (xpu_malloc(&we->dev_f16, (uint64_t) n_f16) != 0 || we->dev_f16 == nullptr) {
+        delete we;
+        return nullptr;
+    }
+    ctx->allocated += n_f16;
+
+    const int rc = xdnn::cast<float, f16_kunlun>(xdnn_ctx, (const float *) w->data,
+                                                 (f16_kunlun *) we->dev_f16, n_elts);
+    if (rc != 0) {
+        xpu_wait();
+        xpu_free(we->dev_f16);
+        ctx->allocated -= n_f16;
+        delete we;
+        return nullptr;
+    }
+
+    g_f16_registry[w->data] = we;
+    const uint64_t n = ++g_f16_conversions;
+    GGML_LOG_INFO("kunlun: f16 weight registry: converted '%s' [%zu x %zu] (#%llu)\n",
+                  w->name, (size_t) w->ne[0], (size_t) w->ne[1],
+                  (unsigned long long) n);
+    return we;
+}
 
 static void ggml_backend_kunlun_lazy_init(void) {
     std::call_once(g_kunlun_init_flag, []() {
@@ -94,6 +216,15 @@ static void ggml_backend_kunlun_lazy_init(void) {
                          (unsigned)((pci >> 3)  & 0x1f),
                          (unsigned)(pci & 0x7));
                 ctx->pci_id = buf;
+            }
+
+            if (xpu_set_device(i) != 0) {
+                GGML_LOG_ERROR("%s: xpu_set_device(%d) failed\n", __func__, i);
+            } else {
+                ctx->xdnn_ctx = xdnn::create_context();
+                if (!ctx->xdnn_ctx) {
+                    GGML_LOG_ERROR("%s: xdnn create_context for PD %d failed\n", __func__, i);
+                }
             }
 
             ggml_backend_device dev = {
@@ -188,6 +319,7 @@ static void ggml_backend_kunlun_buffer_free_buffer(ggml_backend_buffer_t buffer)
         (ggml_backend_kunlun_device_context *) buffer->buft->device->context;
     std::lock_guard<std::mutex> lock(g_kunlun_mutex);
     xpu_set_device(bctx->device);
+    kunlun_registry_sweep((uintptr_t) bctx->dev_ptr, buffer->size);
     xpu_wait();
     xpu_free(bctx->dev_ptr);
     ctx->allocated -= buffer->size;
@@ -207,6 +339,11 @@ static void ggml_backend_kunlun_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     xpu_wait();
     if (rc != 0) {
         GGML_LOG_ERROR("%s: H2D copy failed rc=%d (%s, %zu bytes)\n", __func__, rc, tensor->name, size);
+    }
+    // tensor contents changed: any cached f16 conversion is stale
+    if (kunlun_f16_weight * we = (kunlun_f16_weight *) tensor->extra) {
+        xpu_set_device(we->device);
+        kunlun_f16_weight_release(tensor, we);
     }
 }
 
@@ -289,6 +426,145 @@ static void ggml_backend_kunlun_free(ggml_backend_t backend) {
     delete backend;  // device contexts are static
 }
 
+// fc layout predicate: f32/f16 tensor whose rows are packed in memory
+// (elements contiguous within a row and rows contiguous in memory), and no
+// batch dims - exactly what fc consumes for activations and aliased weights.
+static bool kunlun_rows_ready(const ggml_tensor * t) {
+    const size_t es = ggml_element_size(t);
+    return t->ne[0] >= 1 &&
+           t->ne[2] == 1 &&
+           t->ne[3] == 1 &&
+           t->nb[0] == es &&
+           t->nb[1] == es * (size_t) t->ne[0];
+}
+
+static enum ggml_status kunlun_mul_mat_exec(ggml_backend_kunlun_device_context * ctx,
+                                            ggml_cgraph * cgraph, int node_idx) {
+    ggml_tensor * dst = cgraph->nodes[node_idx];
+    ggml_tensor * w   = dst->src[0];
+    ggml_tensor * a   = dst->src[1];
+
+    const int64_t k = w->ne[0];
+    const int64_t n = w->ne[1];
+    const int64_t m = a->ne[1];
+
+    std::lock_guard<std::mutex> lock(g_kunlun_mutex);
+    if (xpu_set_device(ctx->device) != 0 || !ctx->xdnn_ctx) {
+        return GGML_STATUS_FAILED;
+    }
+    if (m == 0 || n == 0 || k == 0) {
+        return GGML_STATUS_SUCCESS;  // empty batch
+    }
+
+    // --- weights: alias f16 bytes, or lazy f32 -> f16 conversion ----------
+    void * w_f16 = nullptr;
+    if (w->type == GGML_TYPE_F16) {
+        w_f16 = w->data;  // already f16 on this PD: alias, zero copy
+    } else {
+        kunlun_f16_weight * we = (kunlun_f16_weight *) w->extra;
+        if (!we) {
+            we = kunlun_f32_to_f16(w, ctx, ctx->xdnn_ctx);
+            if (!we) {
+                return GGML_STATUS_FAILED;
+            }
+            w->extra = we;
+        }
+        w_f16 = we->dev_f16;
+    }
+
+    // --- activations: f16 bytes for fc (staged H2D when host-side) --------
+    void * a_f16 = nullptr;
+    void * x_scratch = nullptr;  // staging scratch, freed below
+    if (a->type == GGML_TYPE_F16 && ggml_backend_buffer_is_kunlun(a)) {
+        a_f16 = a->data;
+    } else if (a->type == GGML_TYPE_F32 && ggml_backend_buffer_is_kunlun(a)) {
+        const size_t xbytes = (size_t) k * m * sizeof(f16_kunlun);
+        if (xpu_malloc(&x_scratch, (uint64_t) xbytes) != 0 || !x_scratch) {
+            return GGML_STATUS_FAILED;
+        }
+        ctx->allocated += xbytes;
+        if (xdnn::cast<float, f16_kunlun>(ctx->xdnn_ctx, (const float *) a->data,
+                                          (f16_kunlun *) x_scratch, k * m) != 0) {
+            xpu_wait();
+            xpu_free(x_scratch);
+            ctx->allocated -= xbytes;
+            return GGML_STATUS_FAILED;
+        }
+        a_f16 = x_scratch;
+    } else {
+        // host-side activations: convert on host, one H2D hop
+        const size_t xbytes = (size_t) k * m * sizeof(f16_kunlun);
+        std::vector<f16_kunlun> stage((size_t) k * m);
+        if (a->type == GGML_TYPE_F32) {
+            const float * src = (const float *) a->data;
+            for (size_t i = 0; i < stage.size(); i++) {
+                stage[i] = f16_kunlun(src[i]);
+            }
+        } else {
+            std::memcpy(stage.data(), a->data, xbytes);
+        }
+        if (xpu_malloc(&x_scratch, (uint64_t) xbytes) != 0 || !x_scratch) {
+            return GGML_STATUS_FAILED;
+        }
+        ctx->allocated += xbytes;
+        xpu_memcpy(x_scratch, stage.data(), xbytes, XPU_HOST_TO_DEVICE);
+        a_f16 = x_scratch;
+    }
+
+    // --- output: f16 dst direct when contiguous, f32 dst via scratch+cast --
+    void * y_f16;
+    void * y_scratch = nullptr;
+    const bool dst_direct = (dst->type == GGML_TYPE_F16) && ggml_backend_buffer_is_kunlun(dst);
+    if (dst_direct) {
+        y_f16 = dst->data;
+    } else {
+        const size_t ybytes = (size_t) n * m * sizeof(f16_kunlun);
+        if (xpu_malloc(&y_scratch, (uint64_t) ybytes) != 0 || !y_scratch) {
+            if (x_scratch) {
+                xpu_wait();
+                xpu_free(x_scratch);
+                ctx->allocated -= (size_t) k * m * sizeof(f16_kunlun);
+            }
+            return GGML_STATUS_FAILED;
+        }
+        ctx->allocated += ybytes;
+        y_f16 = y_scratch;
+    }
+
+    const int rc = xdnn::fc<f16_kunlun, f16_kunlun, f16_kunlun, short>(
+        ctx->xdnn_ctx, (const f16_kunlun *) a_f16, (const f16_kunlun *) w_f16,
+        (f16_kunlun *) y_f16, m, n, k, false, true, nullptr, nullptr, nullptr);
+
+    enum ggml_status st = GGML_STATUS_SUCCESS;
+    if (rc != 0) {
+        GGML_LOG_ERROR("%s: fc rc=%d node '%s' [%lld x %lld x %lld]\n", __func__, rc,
+                       dst->name, (long long) m, (long long) n, (long long) k);
+        st = GGML_STATUS_FAILED;
+    } else if (!dst_direct) {
+        // f32 dst: cast the f16 scratch into it on device (dst is contiguous
+        // rows by the supports_op gate, so the element order matches)
+        const int rc2 = xdnn::cast<f16_kunlun, float>(ctx->xdnn_ctx,
+            (const f16_kunlun *) y_f16, (float *) dst->data, (int64_t) n * m);
+        if (rc2 != 0) {
+            GGML_LOG_ERROR("%s: cast rc=%d node '%s'\n", __func__, rc2, dst->name);
+            st = GGML_STATUS_FAILED;
+        }
+    }
+
+    // scratch is read by queued kernels: drain the stream before freeing
+    if (x_scratch) {
+        xpu_wait();
+        xpu_free(x_scratch);
+        ctx->allocated -= (size_t) k * m * sizeof(f16_kunlun);
+    }
+    if (y_scratch) {
+        xpu_wait();
+        xpu_free(y_scratch);
+        ctx->allocated -= (size_t) n * m * sizeof(f16_kunlun);
+    }
+    return st;
+}
+
 static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_kunlun_device_context * ctx =
         (ggml_backend_kunlun_device_context *) backend->device->context;
@@ -325,6 +601,14 @@ static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend
                     if (rc != 0) {
                         GGML_LOG_ERROR("%s: CPY rc=%d\n", __func__, rc);
                         return GGML_STATUS_FAILED;
+                    }
+                }
+                break;
+            case GGML_OP_MUL_MAT:
+                {
+                    const enum ggml_status st = kunlun_mul_mat_exec(ctx, cgraph, i);
+                    if (st != GGML_STATUS_SUCCESS) {
+                        return st;
                     }
                 }
                 break;
@@ -432,12 +716,89 @@ static ggml_backend_buffer_type_t ggml_backend_kunlun_device_get_buffer_type(ggm
     return &g_kunlun_buft[idx];
 }
 
+static bool kunlun_dev_supports_mul_mat(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    const ggml_tensor * w = op->src[0];
+    const ggml_tensor * a = op->src[1];
+    if (!w || !a) {
+        return false;
+    }
+
+    // weights must live on this very PD: f16 is aliased raw, f32 is converted
+    // into a device buffer of this PD. Other backends' weights stay CPU-side.
+    if (!ggml_backend_buffer_is_kunlun(w)) {
+        return false;
+    }
+    const kunlun_buffer_ctx * wc = (const kunlun_buffer_ctx *) w->buffer->context;
+    const ggml_backend_kunlun_device_context * ctx =
+        (ggml_backend_kunlun_device_context *) dev->context;
+    if (wc->device != ctx->device || !ctx->xdnn_ctx) {
+        return false;
+    }
+
+    if (w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (op->type != GGML_TYPE_F32 && op->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    // activations: same PD, or plain host memory (staged H2D in the op)
+    if (a->buffer) {
+        if (!ggml_backend_buffer_is_kunlun(a)) {
+            return false;
+        }
+        const kunlun_buffer_ctx * ac = (const kunlun_buffer_ctx *) a->buffer->context;
+        if (ac->device != ctx->device) {
+            return false;
+        }
+    }
+
+    // single matrix pair only: no batched/broadcast MUL_MAT
+    if (w->ne[2] != 1 || w->ne[3] != 1) {
+        return false;
+    }
+    if (a->ne[2] != 1 || a->ne[3] != 1) {
+        return false;
+    }
+    if (op->ne[2] != 1 || op->ne[3] != 1) {
+        return false;
+    }
+
+    // shapes
+    if (a->ne[0] != w->ne[0]) {
+        return false;
+    }
+    if (op->ne[0] != w->ne[1] || op->ne[1] != a->ne[1]) {
+        return false;
+    }
+
+    // fc consumes packed rows: elements contiguous within a row, rows
+    // contiguous in memory; empty tensors are fine (early-return in op)
+    const bool empty = w->ne[0] == 0 || w->ne[1] == 0 || a->ne[1] == 0;
+    if (!empty) {
+        if (!kunlun_rows_ready(w) || !kunlun_rows_ready(a)) {
+            return false;
+        }
+        if (!ggml_is_contiguous(op)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
     switch (op->op) {
+        case GGML_OP_NONE:
+            return true;  // input/output tensors live on this backend
         case GGML_OP_CPY:
         case GGML_OP_CONT:
             return ggml_backend_buffer_is_kunlun(op->src[0]) && ggml_backend_buffer_is_kunlun(op);
+        case GGML_OP_MUL_MAT:
+            return kunlun_dev_supports_mul_mat(dev, op);
         default:
             return false;
     }
