@@ -10,19 +10,34 @@
 //     one mutex and set the device before every call.
 //   - everything is async; xpu_wait() before host-consumed D2H reads.
 
+// xpu float16.h defines global fp32_from_bits/fp32_to_bits that collide with
+// ggml-impl.h's same-named local helpers; rename ggml-impl.h's in this TU only.
+// ggml.h must therefore be parsed inside the macro window, before any xpu header.
+#define fp32_from_bits ggml_kunlun_fp32_from_bits
+#define fp32_to_bits ggml_kunlun_fp32_to_bits
+#include "ggml.h"
+#include "ggml-impl.h"
+#undef fp32_from_bits
+#undef fp32_to_bits
+
 #include "ggml-kunlun.h"
 #include "ggml-backend-impl.h"
-#include "ggml-impl.h"
+#include "ggml-kunlun-staging.h"
 
 #include <xpu/runtime.h>
+#include <xpu/xdnn.h>
 
 #include <atomic>
+#include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <string>
 #include <vector>
+
+namespace xdnn = baidu::xpu::api;
+using f16 = float16;
 
 #define GGML_KUNLUN_MAX_ALLOC  ((4ull << 30) - (128ull << 20))  // 4.0 GB ok, 4.5 GB fails (measured)
 
@@ -55,7 +70,19 @@ struct ggml_backend_kunlun_device_context {
     std::string  name;
     std::string  description;
     std::string  pci_id;
+    xdnn::Context * xdnn = nullptr;  // created lazily under g_kunlun_mutex
 };
+
+// callers hold g_kunlun_mutex and have set the device
+static xdnn::Context * kunlun_xdnn_ctx(ggml_backend_kunlun_device_context * ctx) {
+    if (ctx->xdnn == nullptr) {
+        ctx->xdnn = xdnn::create_context();
+        if (ctx->xdnn == nullptr) {
+            GGML_LOG_ERROR("%s: xdnn::create_context failed on PD %d\n", __func__, ctx->device);
+        }
+    }
+    return ctx->xdnn;
+}
 
 static std::vector<ggml_backend_device>      g_kunlun_devices;
 static std::vector<ggml_backend_buffer_type> g_kunlun_buft;
@@ -277,6 +304,174 @@ static ggml_backend_buffer_i ggml_backend_kunlun_buffer_interface(void) {
 }
 
 // ---------------------------------------------------------------------------
+// per-device scratch (activation staging + output fallback), grows on demand
+
+struct kunlun_scratch {
+    void * x    = nullptr;   // fp16 activation staging [m][k]
+    size_t x_n  = 0;
+    void * y    = nullptr;   // fp16 output scratch [m][n]
+    size_t y_n  = 0;
+    void * tmp  = nullptr;   // fp32 staging for output round-trips
+    size_t tmp_n = 0;
+};
+
+static std::array<kunlun_scratch, 8> g_kunlun_scratch;  // indexed by PD id
+
+static bool kunlun_scratch_ensure(void ** buf, size_t * cap, size_t need) {
+    if (*cap >= need) {
+        return true;
+    }
+    if (need > GGML_KUNLUN_MAX_ALLOC) {
+        return false;
+    }
+    if (*buf != nullptr) {
+        xpu_free(*buf);
+        *buf = nullptr;
+        *cap = 0;
+    }
+    int rc = xpu_malloc(buf, (uint64_t) need);
+    if (rc != 0 || *buf == nullptr) {
+        GGML_LOG_ERROR("%s: scratch xpu_malloc(%zu) failed rc=%d\n", __func__, need, rc);
+        *buf = nullptr;
+        return false;
+    }
+    *cap = need;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// MUL_MAT fp16 path: fc<f16,f16,f16,short>(..., x_trans=false, w_trans=true)
+
+static enum ggml_status ggml_backend_kunlun_mul_mat(ggml_backend_t backend, ggml_tensor * node) {
+    ggml_backend_kunlun_device_context * ctx =
+        (ggml_backend_kunlun_device_context *) backend->device->context;
+    if (ctx->device < 0 || (size_t) ctx->device >= g_kunlun_scratch.size()) {
+        GGML_LOG_ERROR("%s: PD id %d out of scratch range\n", __func__, ctx->device);
+        return GGML_STATUS_FAILED;
+    }
+    kunlun_scratch * sc = &g_kunlun_scratch[ctx->device];
+
+    ggml_tensor * src0 = node->src[0];
+    ggml_tensor * src1 = node->src[1];
+    ggml_tensor * dst  = node;
+
+    int64_t m, n, k;
+    if (!kunlun_mul_mat_dims(src0, src1, &m, &n, &k)) {
+        GGML_LOG_ERROR("%s: unsupported MUL_MAT shape %s x %s\n", __func__,
+                       src0->name, src1->name);
+        return GGML_STATUS_FAILED;
+    }
+    if (m == 0) {
+        return GGML_STATUS_SUCCESS;  // fc rejects m=0 (rc=1, measured)
+    }
+
+    // weights: contiguous F16 src0 [k,n] is row-major [n][k] = fc's W with w_trans=true
+    if (src0->type != GGML_TYPE_F16 || !ggml_is_contiguous(src0) ||
+        !ggml_backend_buffer_is_kunlun(src0) ||
+        ((kunlun_buffer_ctx *) src0->buffer->context)->device != ctx->device) {
+        GGML_LOG_ERROR("%s: weights must be contiguous F16 resident on this PD (%s)\n",
+                       __func__, src0->name);
+        return GGML_STATUS_FAILED;
+    }
+
+    std::lock_guard<std::mutex> lock(g_kunlun_mutex);
+    if (xpu_set_device(ctx->device) != 0) {
+        return GGML_STATUS_FAILED;
+    }
+    xdnn::Context * xctx = kunlun_xdnn_ctx(ctx);
+    if (xctx == nullptr) {
+        return GGML_STATUS_FAILED;
+    }
+
+    // activation staging: H2D as f16; device-resident f16 rows alias directly
+    const f16 * x = nullptr;
+    std::vector<f16> host_stage;
+    bool src1_on_dev = ggml_backend_buffer_is_kunlun(src1);
+    if (src1_on_dev && ((kunlun_buffer_ctx *) src1->buffer->context)->device != ctx->device) {
+        GGML_LOG_ERROR("%s: src1 on other PD (%s)\n", __func__, src1->name);
+        return GGML_STATUS_FAILED;
+    }
+
+    if (src1_on_dev && src1->type == GGML_TYPE_F16 && ggml_is_contiguous(src1)) {
+        x = (const f16 *) src1->data;
+    } else if (src1_on_dev && src1->type == GGML_TYPE_F32 && ggml_is_contiguous(src1)) {
+        if (!kunlun_scratch_ensure(&sc->tmp, &sc->tmp_n, (size_t) m * k * sizeof(float))) {
+            return GGML_STATUS_FAILED;
+        }
+        int rc = xdnn::cast<float, f16>(xctx, (const float *) src1->data, (f16 *) sc->tmp, m * k);
+        if (rc != 0) {
+            GGML_LOG_ERROR("%s: device cast f32->f16 rc=%d (%s)\n", __func__, rc, src1->name);
+            return GGML_STATUS_FAILED;
+        }
+        x = (const f16 *) sc->tmp;
+    } else {
+        // host src1, or strided device view: pack rows into fp16 on host, then H2D
+        ggml_tensor packed = *src1;
+        std::vector<char> raw;
+        if (src1_on_dev) {
+            size_t region = (size_t) ((m - 1) * src1->nb[1] + k * ggml_element_size(src1));
+            raw.resize(region);
+            xpu_memcpy(raw.data(), src1->data, region, XPU_DEVICE_TO_HOST);
+            xpu_wait();
+            packed.data = raw.data();
+        }
+        host_stage.resize((size_t) m * k);
+        kunlun_stage_activation_f16(&packed, m, k, host_stage.data());
+        if (!kunlun_scratch_ensure(&sc->x, &sc->x_n, host_stage.size() * sizeof(f16))) {
+            return GGML_STATUS_FAILED;
+        }
+        int rc = xpu_memcpy(sc->x, host_stage.data(), host_stage.size() * sizeof(f16),
+                            XPU_HOST_TO_DEVICE);
+        if (rc != 0) {
+            GGML_LOG_ERROR("%s: activation H2D rc=%d (%s)\n", __func__, rc, src1->name);
+            return GGML_STATUS_FAILED;
+        }
+        x = (const f16 *) sc->x;
+    }
+
+    // output: f16 dst contiguous on this PD -> fc writes directly; else scratch + copy out
+    f16 * y = nullptr;
+    bool dst_direct = dst->type == GGML_TYPE_F16 && ggml_is_contiguous(dst) &&
+                      ggml_backend_buffer_is_kunlun(dst) &&
+                      ((kunlun_buffer_ctx *) dst->buffer->context)->device == ctx->device;
+    if (dst_direct) {
+        y = (f16 *) dst->data;
+    } else {
+        if (!kunlun_scratch_ensure(&sc->y, &sc->y_n, (size_t) m * n * sizeof(f16))) {
+            return GGML_STATUS_FAILED;
+        }
+        y = (f16 *) sc->y;
+    }
+
+    int rc = xdnn::fc<f16, f16, f16, short>(xctx, x, (const f16 *) src0->data,
+                                            y, m, n, k, false, true, nullptr, nullptr, nullptr);
+    if (rc != 0) {
+        GGML_LOG_ERROR("%s: fc rc=%d (m=%lld n=%lld k=%lld, %s)\n", __func__, rc,
+                       (long long) m, (long long) n, (long long) k, dst->name);
+        return GGML_STATUS_FAILED;
+    }
+    xpu_wait();
+
+    if (!dst_direct) {
+        std::vector<f16> out((size_t) m * n);
+        xpu_memcpy(out.data(), y, out.size() * sizeof(f16), XPU_DEVICE_TO_HOST);
+        xpu_wait();
+        for (int64_t i = 0; i < m; i++) {
+            char * row = (char *) dst->data + i * dst->nb[1];
+            if (dst->type == GGML_TYPE_F16) {
+                memcpy(row, out.data() + i * n, (size_t) n * sizeof(f16));
+            } else {
+                float * frow = (float *) row;
+                for (int64_t j = 0; j < n; j++) {
+                    frow[j] = (float) out[i * n + j];
+                }
+            }
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
 // backend (graph compute)
 
 static const char * ggml_backend_kunlun_name(ggml_backend_t backend) {
@@ -296,6 +491,8 @@ static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
         switch (node->op) {
+            case GGML_OP_MUL_MAT:
+                return ggml_backend_kunlun_mul_mat(backend, node);
             case GGML_OP_CPY:
             case GGML_OP_CONT:
                 {
@@ -435,6 +632,20 @@ static ggml_backend_buffer_type_t ggml_backend_kunlun_device_get_buffer_type(ggm
 static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
     switch (op->op) {
+        case GGML_OP_MUL_MAT:
+            {
+                const ggml_tensor * src0 = op->src[0];
+                const ggml_tensor * src1 = op->src[1];
+                if (src0->type != GGML_TYPE_F16 || !ggml_is_contiguous(src0)) {
+                    return false;
+                }
+                if ((src1->type != GGML_TYPE_F32 && src1->type != GGML_TYPE_F16) ||
+                    (op->type != GGML_TYPE_F16 && op->type != GGML_TYPE_F32)) {
+                    return false;
+                }
+                int64_t m, n, k;
+                return kunlun_mul_mat_dims(src0, src1, &m, &n, &k);
+            }
         case GGML_OP_CPY:
         case GGML_OP_CONT:
             return ggml_backend_buffer_is_kunlun(op->src[0]) && ggml_backend_buffer_is_kunlun(op);
