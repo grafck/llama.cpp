@@ -1595,6 +1595,15 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // m=0 empty batch: there is nothing for FlashAttention or the CPU fallback to process,
+    // and kernels built for an empty batch can abort on zero-size math - return without
+    // building or computing a graph
+    if (ubatch.n_tokens == 0) {
+        LLAMA_LOG_INFO("%s: m=0 empty batch - early return, skipping FA/CPU batch processing\n", __func__);
+        ret = GGML_STATUS_SUCCESS;
+        return get_gf_res_small(ubatch);
+    }
+
 
     const bool small = !cparams.pipeline_parallel && ubatch.n_tokens <= LLAMA_GRAPH_SMALL_MAX_TOKENS;
     auto * res = small ? get_gf_res_small(ubatch) : get_gf_res_prev();

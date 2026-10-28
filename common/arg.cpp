@@ -1143,6 +1143,16 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
         ggml_backend_load_all();
         for (const auto & device : dev_names) {
             auto * dev = ggml_backend_dev_by_name(device.c_str());
+            if (!dev) {
+                // accept the NAME[idx] form as an alias for NAMEidx (e.g. KUNLUN[0] -> KUNLUN0)
+                const auto lb = device.find('[');
+                if (lb != std::string::npos && device.back() == ']') {
+                    const std::string idx = device.substr(lb + 1, device.size() - lb - 2);
+                    if (!idx.empty() && idx.find_first_not_of("0123456789") == std::string::npos) {
+                        dev = ggml_backend_dev_by_name((device.substr(0, lb) + idx).c_str());
+                    }
+                }
+            }
             if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
                 throw std::invalid_argument(string_format("invalid device: %s", device.c_str()));
             }

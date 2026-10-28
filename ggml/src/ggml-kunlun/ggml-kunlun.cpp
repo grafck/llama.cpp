@@ -45,6 +45,25 @@ static bool ggml_backend_buffer_is_kunlun(const struct ggml_tensor * tensor) {
            tensor->buffer->buft->device->reg == ggml_backend_kunlun_reg();
 }
 
+// a tensor, or any view of it, living in a Kunlun buffer (KV cache slices are views)
+static bool ggml_backend_buffer_is_kunlun_deep(const struct ggml_tensor * tensor) {
+    while (tensor) {
+        if (ggml_backend_buffer_is_kunlun(tensor)) {
+            return true;
+        }
+        tensor = tensor->view_src;
+    }
+    return false;
+}
+
+// owning PD context of a tensor or a view of it (nullptr when not on a Kunlun buffer)
+static kunlun_buffer_ctx * ggml_backend_kunlun_ctx(const struct ggml_tensor * tensor) {
+    while (tensor && !ggml_backend_buffer_is_kunlun(tensor)) {
+        tensor = tensor->view_src;
+    }
+    return tensor ? (kunlun_buffer_ctx *) tensor->buffer->context : nullptr;
+}
+
 // ---------------------------------------------------------------------------
 // global device state
 
@@ -73,6 +92,10 @@ static void ggml_backend_kunlun_lazy_init(void) {
             return;
         }
         g_kunlun_n_dev = count;
+        // reserve first: buft.device points into g_kunlun_devices, a realloc would leave
+        // the earlier entries dangling and supports_buft would fail for PD 0
+        g_kunlun_devices.reserve(count);
+        g_kunlun_buft.reserve(count);
         for (int i = 0; i < count; i++) {
             uint64_t cap = 0;
             if (xpu_device_get_attr(&cap, XPUATTR_MEM_MAIN_CAPACITY, i) != 0) {
@@ -239,9 +262,9 @@ static void ggml_backend_kunlun_buffer_clear(ggml_backend_buffer_t buffer, uint8
 
 static bool ggml_backend_kunlun_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
                                                   const struct ggml_tensor * src, struct ggml_tensor * dst) {
-    if (ggml_backend_buffer_is_kunlun(src)) {
+    if (ggml_backend_buffer_is_kunlun_deep(src)) {
         kunlun_buffer_ctx * dst_ctx = (kunlun_buffer_ctx *) buffer->context;
-        kunlun_buffer_ctx * src_ctx = (kunlun_buffer_ctx *) src->buffer->context;
+        kunlun_buffer_ctx * src_ctx = ggml_backend_kunlun_ctx(src);
         size_t nbytes = ggml_nbytes(src);
         std::lock_guard<std::mutex> lock(g_kunlun_mutex);
         int rc;
@@ -289,43 +312,204 @@ static void ggml_backend_kunlun_free(ggml_backend_t backend) {
     delete backend;  // device contexts are static
 }
 
+// convert one row of ne elements from src_type to dst_type (host staging)
+// covers the KV append/read cases: f32 <-> f16, f32 -> bf16, same-type memcpy
+static bool ggml_backend_kunlun_convert_row(enum ggml_type src_type, enum ggml_type dst_type,
+                                            void * dst, const void * src, int64_t ne) {
+    if (src_type == dst_type) {
+        memcpy(dst, src, ggml_row_size(dst_type, ne));
+        return true;
+    }
+    if (src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
+        const float * f = (const float *) src;
+        _Float16 * h = (_Float16 *) dst;
+        for (int64_t i = 0; i < ne; i++) {
+            h[i] = (_Float16) f[i];
+        }
+        return true;
+    }
+    if (src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_BF16) {
+        const float * f = (const float *) src;
+        uint16_t * b = (uint16_t *) dst;
+        for (int64_t i = 0; i < ne; i++) {
+            uint32_t x;
+            memcpy(&x, &f[i], 4);
+            // round-to-nearest-even, discard low 16 bits
+            uint32_t r = (x + 0x7fff + ((x >> 16) & 1)) >> 16;
+            b[i] = (uint16_t) r;
+        }
+        return true;
+    }
+    if (src_type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F32) {
+        const _Float16 * h = (const _Float16 *) src;
+        float * f = (float *) dst;
+        for (int64_t i = 0; i < ne; i++) {
+            f[i] = (float) h[i];
+        }
+        return true;
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_kunlun_device_context * ctx =
         (ggml_backend_kunlun_device_context *) backend->device->context;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+        // no-op nodes carry no compute (same set as ggml-cuda): empty tensors (m=0 batches),
+        // views and reshapes
+        if (ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE) {
+            if (ggml_is_empty(node)) {
+                GGML_LOG_DEBUG("%s: m=0 empty node '%s' (%s) - early return, skipping dispatch\n",
+                               __func__, node->name, ggml_op_name(node->op));
+            }
+            continue;
+        }
         switch (node->op) {
             case GGML_OP_CPY:
             case GGML_OP_CONT:
                 {
-                    // device-to-device copy within this PD (host transfers are
-                    // split out of the graph by the scheduler)
                     ggml_tensor * src = node->src[0];
                     ggml_tensor * dst = node;
-                    if (!ggml_backend_buffer_is_kunlun(src) || !ggml_backend_buffer_is_kunlun(dst)) {
-                        GGML_LOG_ERROR("%s: CPY with non-device tensor\n", __func__);
+                    if (!ggml_backend_buffer_is_kunlun_deep(dst)) {
+                        GGML_LOG_ERROR("%s: CPY dst is not a device tensor\n", __func__);
                         return GGML_STATUS_FAILED;
                     }
-                    kunlun_buffer_ctx * src_ctx = (kunlun_buffer_ctx *) src->buffer->context;
-                    kunlun_buffer_ctx * dst_ctx = (kunlun_buffer_ctx *) dst->buffer->context;
+
+                    const int64_t ne  = ggml_nelements(dst);
+                    const size_t  nbytes_dst = ggml_nbytes(dst);
+
                     std::lock_guard<std::mutex> lock(g_kunlun_mutex);
-                    int rc;
-                    if (src_ctx->device == dst_ctx->device) {
-                        xpu_set_device(ctx->device);
-                        rc = xpu_memcpy((char *) dst->data,
-                                        (const char *) src->data,
-                                        ggml_nbytes(src), XPU_DEVICE_TO_DEVICE);
-                    } else {
-                        rc = xpu_memcpy_peer(dst_ctx->device, (char *) dst->data,
-                                             src_ctx->device, (const char *) src->data,
-                                             ggml_nbytes(src));
+                    int rc = 0;
+
+                    if (ggml_backend_buffer_is_kunlun_deep(src)) {
+                        // device-to-device copy (same PD, or cross-PD via the xpu link)
+                        if (src->type != dst->type) {
+                            GGML_LOG_ERROR("%s: D2D CPY with type change %s -> %s unsupported\n",
+                                           __func__, ggml_type_name(src->type), ggml_type_name(dst->type));
+                            return GGML_STATUS_FAILED;
+                        }
+                        kunlun_buffer_ctx * src_ctx = ggml_backend_kunlun_ctx(src);
+                        kunlun_buffer_ctx * dst_ctx = ggml_backend_kunlun_ctx(dst);
+                        if (src_ctx->device == dst_ctx->device) {
+                            xpu_set_device(ctx->device);
+                            rc = xpu_memcpy((char *) dst->data,
+                                            (const char *) src->data,
+                                            ggml_nbytes(src), XPU_DEVICE_TO_DEVICE);
+                        } else {
+                            rc = xpu_memcpy_peer(dst_ctx->device, (char *) dst->data,
+                                                 src_ctx->device, (const char *) src->data,
+                                                 ggml_nbytes(src));
+                        }
+                        xpu_wait();
+                        if (rc != 0) {
+                            GGML_LOG_ERROR("%s: CPY rc=%d\n", __func__, rc);
+                            return GGML_STATUS_FAILED;
+                        }
+                        break;
                     }
+
+                    // host src (KV append: computed f32 rows -> device cache of f16):
+                    // convert in a host staging buffer, then upload
+                    std::vector<char> buf(nbytes_dst);
+                    if (!ggml_backend_kunlun_convert_row(src->type, dst->type, buf.data(), src->data, ne)) {
+                        GGML_LOG_ERROR("%s: CPY conversion %s -> %s unsupported\n",
+                                       __func__, ggml_type_name(src->type), ggml_type_name(dst->type));
+                        return GGML_STATUS_FAILED;
+                    }
+                    xpu_set_device(ctx->device);
+                    rc = xpu_memcpy((char *) dst->data, buf.data(), nbytes_dst, XPU_HOST_TO_DEVICE);
                     xpu_wait();
                     if (rc != 0) {
-                        GGML_LOG_ERROR("%s: CPY rc=%d\n", __func__, rc);
+                        GGML_LOG_ERROR("%s: CPY H2D rc=%d\n", __func__, rc);
                         return GGML_STATUS_FAILED;
                     }
+                }
+                break;
+            case GGML_OP_SET_ROWS:
+                {
+                    // in-place row write into the device cache tensor (KV append):
+                    // dst = cache (this node), src[0] = row values, src[1] = int64 row indices;
+                    // row addressing happens here, matching the CPU kernel's (i, i02%ne11, i03%ne12) mapping
+                    ggml_tensor * cache = node;
+                    ggml_tensor * src   = node->src[0];
+                    ggml_tensor * idx   = node->src[1];
+
+                    if (!ggml_backend_buffer_is_kunlun_deep(cache)) {
+                        GGML_LOG_ERROR("%s: SET_ROWS cache is not a device tensor\n", __func__);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    const int64_t nc = src->ne[0];
+                    const int64_t nr = src->ne[1];  // rows written = rows of the values tensor
+
+                    std::lock_guard<std::mutex> lock(g_kunlun_mutex);
+                    xpu_set_device(ctx->device);
+
+                    // the scheduler may have copied idx to a device buffer - read it to host first
+                    const int64_t n_idx = ggml_nelements(idx);
+                    std::vector<int64_t> idx_rows(n_idx);
+                    if (ggml_backend_buffer_is_kunlun_deep(idx)) {
+                        int rc = xpu_memcpy(idx_rows.data(), idx->data, n_idx * sizeof(int64_t), XPU_DEVICE_TO_HOST);
+                        xpu_wait();
+                        if (rc != 0) {
+                            GGML_LOG_ERROR("%s: SET_ROWS idx D2H rc=%d\n", __func__, rc);
+                            return GGML_STATUS_FAILED;
+                        }
+                    } else {
+                        memcpy(idx_rows.data(), idx->data, n_idx * sizeof(int64_t));
+                    }
+
+                    for (int64_t i03 = 0; i03 < cache->ne[3]; i03++) {
+                        for (int64_t i02 = 0; i02 < cache->ne[2]; i02++) {
+                            for (int64_t i = 0; i < nr; i++) {
+                                const int64_t i1 = idx_rows[i +
+                                        (i02 % idx->ne[1]) * idx->ne[0] +
+                                        (i03 % idx->ne[2]) * idx->ne[0] * idx->ne[1]];
+                                if (i1 < 0 || i1 >= cache->ne[1]) {
+                                    GGML_LOG_ERROR("%s: SET_ROWS index %lld out of range %lld\n",
+                                                   __func__, (long long) i1, (long long) cache->ne[1]);
+                                    return GGML_STATUS_FAILED;
+                                }
+
+                                const size_t row_bytes = ggml_row_size(cache->type, nc);
+                                const size_t src_row   = ggml_row_size(src->type, nc);
+
+                                std::vector<char> row(row_bytes);
+                                const char * src_ptr = (const char *) src->data +
+                                    i * src->nb[1] + i02 * src->nb[2] + i03 * src->nb[3];
+
+                                int rc;
+                                if (ggml_backend_buffer_is_kunlun_deep(src)) {
+                                    std::vector<char> stage(src_row);
+                                    rc = xpu_memcpy(stage.data(), src_ptr, src_row, XPU_DEVICE_TO_HOST);
+                                    if (rc == 0) {
+                                        rc = ggml_backend_kunlun_convert_row(src->type, cache->type,
+                                                                             row.data(), stage.data(), nc) ? 0 : 1;
+                                    }
+                                } else {
+                                    rc = ggml_backend_kunlun_convert_row(src->type, cache->type,
+                                                                         row.data(), src_ptr, nc) ? 0 : 1;
+                                }
+                                if (rc != 0) {
+                                    GGML_LOG_ERROR("%s: SET_ROWS row convert/copy failed (%s -> %s)\n",
+                                                   __func__, ggml_type_name(src->type), ggml_type_name(cache->type));
+                                    return GGML_STATUS_FAILED;
+                                }
+
+                                rc = xpu_memcpy((char *) cache->data +
+                                                i1 * cache->nb[1] + i02 * cache->nb[2] + i03 * cache->nb[3],
+                                                row.data(), row_bytes, XPU_HOST_TO_DEVICE);
+                                if (rc != 0) {
+                                    GGML_LOG_ERROR("%s: SET_ROWS H2D rc=%d\n", __func__, rc);
+                                    return GGML_STATUS_FAILED;
+                                }
+                            }
+                        }
+                    }
+                    xpu_wait();
                 }
                 break;
             default:
@@ -434,10 +618,23 @@ static ggml_backend_buffer_type_t ggml_backend_kunlun_device_get_buffer_type(ggm
 
 static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     GGML_UNUSED(dev);
+    if (ggml_is_empty(op)) {
+        // empty tensors (m=0 batches) need no kernel
+        return true;
+    }
     switch (op->op) {
+        case GGML_OP_NONE:
+        case GGML_OP_RESHAPE:
+        case GGML_OP_VIEW:
+        case GGML_OP_PERMUTE:
+        case GGML_OP_TRANSPOSE:
+            // no-op nodes: the tensor only carries data/views
+            return true;
         case GGML_OP_CPY:
         case GGML_OP_CONT:
-            return ggml_backend_buffer_is_kunlun(op->src[0]) && ggml_backend_buffer_is_kunlun(op);
+            return ggml_backend_buffer_is_kunlun_deep(op) || ggml_backend_buffer_is_kunlun_deep(op->src[0]);
+        case GGML_OP_SET_ROWS:
+            return ggml_backend_buffer_is_kunlun_deep(op);
         default:
             return false;
     }
