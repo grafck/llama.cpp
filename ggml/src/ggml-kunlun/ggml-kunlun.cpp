@@ -45,6 +45,17 @@ static bool ggml_backend_buffer_is_kunlun(const struct ggml_tensor * tensor) {
            tensor->buffer->buft->device->reg == ggml_backend_kunlun_reg();
 }
 
+// a tensor, or any view of it, living in a Kunlun buffer (KV cache slices are views)
+static bool ggml_backend_buffer_is_kunlun_deep(const struct ggml_tensor * tensor) {
+    while (tensor) {
+        if (ggml_backend_buffer_is_kunlun(tensor)) {
+            return true;
+        }
+        tensor = tensor->view_src;
+    }
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // global device state
 
@@ -289,6 +300,45 @@ static void ggml_backend_kunlun_free(ggml_backend_t backend) {
     delete backend;  // device contexts are static
 }
 
+// convert one row of ne elements from src_type to dst_type (host staging)
+// covers the KV append/read cases: f32 <-> f16, f32 -> bf16, same-type memcpy
+static bool ggml_backend_kunlun_convert_row(enum ggml_type src_type, enum ggml_type dst_type,
+                                            void * dst, const void * src, int64_t ne) {
+    if (src_type == dst_type) {
+        memcpy(dst, src, ggml_row_size(dst_type, ne));
+        return true;
+    }
+    if (src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_F16) {
+        const float * f = (const float *) src;
+        _Float16 * h = (_Float16 *) dst;
+        for (int64_t i = 0; i < ne; i++) {
+            h[i] = (_Float16) f[i];
+        }
+        return true;
+    }
+    if (src_type == GGML_TYPE_F32 && dst_type == GGML_TYPE_BF16) {
+        const float * f = (const float *) src;
+        uint16_t * b = (uint16_t *) dst;
+        for (int64_t i = 0; i < ne; i++) {
+            uint32_t x;
+            memcpy(&x, &f[i], 4);
+            // round-to-nearest-even, discard low 16 bits
+            uint32_t r = (x + 0x7fff + ((x >> 16) & 1)) >> 16;
+            b[i] = (uint16_t) r;
+        }
+        return true;
+    }
+    if (src_type == GGML_TYPE_F16 && dst_type == GGML_TYPE_F32) {
+        const _Float16 * h = (const _Float16 *) src;
+        float * f = (float *) dst;
+        for (int64_t i = 0; i < ne; i++) {
+            f[i] = (float) h[i];
+        }
+        return true;
+    }
+    return false;
+}
+
 static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_kunlun_device_context * ctx =
         (ggml_backend_kunlun_device_context *) backend->device->context;
@@ -326,6 +376,156 @@ static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend
                         GGML_LOG_ERROR("%s: CPY rc=%d\n", __func__, rc);
                         return GGML_STATUS_FAILED;
                     }
+                }
+                break;
+            case GGML_OP_SET_ROWS:
+                {
+                    // in-place KV row write: src[0] = values rows (a), src[1] = row
+                    // indices, the node itself is the cache. Mirrors
+                    // ggml_compute_forward_set_rows_impl (ggml-cpu/ops.cpp) exactly:
+                    // loops i03/i02/i over the values tensor dims (ne03/ne02) and its
+                    // row count (ne01); idx read at (i, i02 % ne11, i03 % ne12) using
+                    // idx strides; destination row i1 addressed via cache nb[1..3].
+                    // KV caches are 4D [head_dim, n_ctx, n_head, n_layer] views and the
+                    // idx tensor of the llama cache-update path is 2-column (ne11 = 2).
+                    ggml_tensor * cache = node;
+                    ggml_tensor * a     = node->src[0];
+                    ggml_tensor * idx   = node->src[1];
+
+                    if (!cache || !a || !idx) {
+                        GGML_LOG_ERROR("%s: SET_ROWS missing operand\n", __func__);
+                        return GGML_STATUS_FAILED;
+                    }
+                    if (!ggml_backend_buffer_is_kunlun_deep(cache)) {
+                        GGML_LOG_ERROR("%s: SET_ROWS cache is not a device tensor\n", __func__);
+                        return GGML_STATUS_FAILED;
+                    }
+                    // CPU impl: GGML_ASSERT(src0->type == F32 || src0->type == F16)
+                    if (a->type != GGML_TYPE_F32 && a->type != GGML_TYPE_F16) {
+                        GGML_LOG_ERROR("%s: SET_ROWS values type %s unsupported\n",
+                                       __func__, ggml_type_name(a->type));
+                        return GGML_STATUS_FAILED;
+                    }
+                    // CPU impl switches on idx I64/I32
+                    if (idx->type != GGML_TYPE_I64 && idx->type != GGML_TYPE_I32) {
+                        GGML_LOG_ERROR("%s: SET_ROWS idx type %s unsupported\n",
+                                       __func__, ggml_type_name(idx->type));
+                        return GGML_STATUS_FAILED;
+                    }
+                    // CPU impl asserts: ne0 == nc, ne2 == ne02, ne3 == ne03
+                    if (cache->ne[0] != a->ne[0] || cache->ne[2] != a->ne[2] || cache->ne[3] != a->ne[3]) {
+                        GGML_LOG_ERROR("%s: SET_ROWS shape mismatch cache[%d,%d,%d] vs values[%d,%d,%d]\n",
+                                       __func__, (int) cache->ne[0], (int) cache->ne[2], (int) cache->ne[3],
+                                       (int) a->ne[0], (int) a->ne[2], (int) a->ne[3]);
+                        return GGML_STATUS_FAILED;
+                    }
+                    // CPU impl asserts ne02 % ne11 == 0, ne03 % ne12 == 0
+                    if (idx->ne[1] == 0 || idx->ne[2] == 0 ||
+                        a->ne[2] % idx->ne[1] != 0 || a->ne[3] % idx->ne[2] != 0) {
+                        GGML_LOG_ERROR("%s: SET_ROWS idx dims %lld,%lld do not divide values dims %lld,%lld\n",
+                                       __func__, (long long) idx->ne[1], (long long) idx->ne[2],
+                                       (long long) a->ne[2], (long long) a->ne[3]);
+                        return GGML_STATUS_FAILED;
+                    }
+
+                    const int64_t nc = a->ne[0];   // CPU impl: nc = ne00
+                    const int64_t nr = a->ne[1];   // CPU impl: nr = ne01 (rows of values)
+
+                    std::lock_guard<std::mutex> lock(g_kunlun_mutex);
+                    xpu_set_device(ctx->device);
+
+                    // read the whole idx span to host first (the scheduler may have
+                    // placed idx on a device buffer; idx may be a strided VIEW, so
+                    // elements are addressed via nb, like the CPU impl)
+                    const size_t idx_span = ggml_nbytes(idx);
+                    std::vector<char> idx_host(idx_span);
+                    int rc;
+                    if (ggml_backend_buffer_is_kunlun_deep(idx)) {
+                        rc = xpu_memcpy(idx_host.data(), idx->data, idx_span, XPU_DEVICE_TO_HOST);
+                        xpu_wait();
+                        if (rc != 0) {
+                            GGML_LOG_ERROR("%s: SET_ROWS idx D2H rc=%d\n", __func__, rc);
+                            return GGML_STATUS_FAILED;
+                        }
+                    } else {
+                        memcpy(idx_host.data(), idx->data, idx_span);
+                    }
+                    const bool idx_i64 = (idx->type == GGML_TYPE_I64);
+
+                    auto idx_at = [&](int64_t i, int64_t i02, int64_t i03) -> int64_t {
+                        // byte offset identical to the CPU impl:
+                        // (char *) src1->data + i*nb10 + (i02%ne11)*nb11 + (i03%ne12)*nb12
+                        const char * p = idx_host.data() +
+                                         i * idx->nb[0] +
+                                         (i02 % idx->ne[1]) * idx->nb[1] +
+                                         (i03 % idx->ne[2]) * idx->nb[2];
+                        if (idx_i64) {
+                            int64_t v;
+                            memcpy(&v, p, sizeof(int64_t));
+                            return v;
+                        }
+                        int32_t v32;
+                        memcpy(&v32, p, sizeof(int32_t));
+                        return (int64_t) v32;
+                    };
+
+                    const size_t a_row_bytes     = ggml_row_size(a->type, nc);
+                    const size_t cache_row_bytes = ggml_row_size(cache->type, nc);
+
+                    for (int64_t i03 = 0; i03 < a->ne[3]; ++i03) {        // CPU: ne03
+                        for (int64_t i02 = 0; i02 < a->ne[2]; ++i02) {    // CPU: ne02
+                            for (int64_t i = 0; i < nr; ++i) {           // CPU: ir0..ir1 (values rows)
+                                const int64_t i1 = idx_at(i, i02, i03);
+                                // CPU impl: GGML_ASSERT(i1 >= 0 && i1 < ne1)
+                                if (i1 < 0 || i1 >= cache->ne[1]) {
+                                    GGML_LOG_ERROR("%s: SET_ROWS index %lld out of range %lld\n",
+                                                   __func__, (long long) i1, (long long) cache->ne[1]);
+                                    return GGML_STATUS_FAILED;
+                                }
+
+                                // values row: src0->data + i*nb01 + i02*nb02 + i03*nb03
+                                const char * a_ptr = (const char *) a->data +
+                                                     i * a->nb[1] + i02 * a->nb[2] + i03 * a->nb[3];
+
+                                // bring the row to host (already device-resident values),
+                                // then cast to the cache type ON HOST: f32 -> f16 etc.
+                                std::vector<char> stage(a_row_bytes);
+                                if (ggml_backend_buffer_is_kunlun_deep(a)) {
+                                    rc = xpu_memcpy(stage.data(), a_ptr, a_row_bytes, XPU_DEVICE_TO_HOST);
+                                    xpu_wait();
+                                    if (rc != 0) {
+                                        GGML_LOG_ERROR("%s: SET_ROWS values row D2H rc=%d\n", __func__, rc);
+                                        return GGML_STATUS_FAILED;
+                                    }
+                                } else {
+                                    memcpy(stage.data(), a_ptr, a_row_bytes);
+                                }
+
+                                std::vector<char> row(cache_row_bytes);
+                                if (!ggml_backend_kunlun_convert_row(a->type, cache->type,
+                                                                     row.data(), stage.data(), nc)) {
+                                    GGML_LOG_ERROR("%s: SET_ROWS row convert %s -> %s unsupported\n",
+                                                   __func__, ggml_type_name(a->type), ggml_type_name(cache->type));
+                                    return GGML_STATUS_FAILED;
+                                }
+
+                                // eager API is async: drain pending device work (a compute
+                                // op may still be writing this very cache row) before the
+                                // H2D overwrite of the row
+                                xpu_wait();
+
+                                // destination: dst->data + i1*nb1 + i02*nb2 + i03*nb3
+                                char * dst_ptr = (char *) cache->data +
+                                                 i1 * cache->nb[1] + i02 * cache->nb[2] + i03 * cache->nb[3];
+                                rc = xpu_memcpy(dst_ptr, row.data(), cache_row_bytes, XPU_HOST_TO_DEVICE);
+                                if (rc != 0) {
+                                    GGML_LOG_ERROR("%s: SET_ROWS H2D rc=%d\n", __func__, rc);
+                                    return GGML_STATUS_FAILED;
+                                }
+                            }
+                        }
+                    }
+                    xpu_wait();  // drain the last H2D before the op is considered done
                 }
                 break;
             default:
@@ -438,6 +638,11 @@ static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_CPY:
         case GGML_OP_CONT:
             return ggml_backend_buffer_is_kunlun(op->src[0]) && ggml_backend_buffer_is_kunlun(op);
+        case GGML_OP_SET_ROWS:
+            // routing only: the node is a KV cache (or a view of it); full ggml_set_rows
+            // contract validation (idx dtype, ne relations, row strides) is enforced
+            // defensively in graph_compute and refined by the supports_op card.
+            return ggml_backend_buffer_is_kunlun_deep(op);
         default:
             return false;
     }
