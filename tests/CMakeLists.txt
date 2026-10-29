@@ -362,9 +362,14 @@ if (TARGET gguf-model-data)
 endif()
 
 if (TARGET ggml-kunlun)
-    # SET_ROWS contract tests for the Kunlun backend. Needs a K200 on the bus;
-    # prints SKIP and exits 0 when the device is not present.
+    # SET_ROWS tests for the Kunlun backend. They need a K200 on the bus; both
+    # print SKIP and exit 0 when the device is not present.
     add_executable(test-kunlun-set-rows-contract test-kunlun-set-rows-contract.cpp)
     target_link_libraries(test-kunlun-set-rows-contract PRIVATE ggml-base ggml-kunlun)
     llama_test(test-kunlun-set-rows-contract LABEL "kunlun")
+
+    # 4D f16 device KV cache round trip: 2-column idx, f32 -> f16 cast, D2H read-back
+    add_executable(test-kunlun-set-rows-4d-roundtrip test-kunlun-set-rows-4d-roundtrip.cpp)
+    target_link_libraries(test-kunlun-set-rows-4d-roundtrip PRIVATE ggml-base ggml-kunlun)
+    llama_test(test-kunlun-set-rows-4d-roundtrip LABEL "kunlun")
 endif()
