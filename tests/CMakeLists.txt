@@ -360,3 +360,11 @@ if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+
+if (TARGET ggml-kunlun)
+    # SET_ROWS contract tests for the Kunlun backend. Needs a K200 on the bus;
+    # prints SKIP and exits 0 when the device is not present.
+    add_executable(test-kunlun-set-rows-contract test-kunlun-set-rows-contract.cpp)
+    target_link_libraries(test-kunlun-set-rows-contract PRIVATE ggml-base ggml-kunlun)
+    llama_test(test-kunlun-set-rows-contract LABEL "kunlun")
+endif()
