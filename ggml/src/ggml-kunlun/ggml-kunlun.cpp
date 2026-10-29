@@ -16,6 +16,7 @@
 #include "ggml-impl.h"
 
 #include <xpu/runtime.h>
+#include "ggml-kunlun-ops.h"
 
 #include <atomic>
 #include <cstdio>
@@ -25,6 +26,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+
 
 #define GGML_KUNLUN_MAX_ALLOC  ((4ull << 30) - (128ull << 20))  // 4.0 GB ok, 4.5 GB fails (measured)
 
@@ -68,6 +70,40 @@ static const kunlun_weight_entry * kunlun_weight_lookup(const struct ggml_tensor
         return nullptr;
     }
     return &it->second;
+}
+
+// on-device format of a tensor with no registry entry
+static enum kunlun_tensor_fmt kunlun_fmt_from_type(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_F16: return KUNLUN_FMT_F16;
+        case GGML_TYPE_F32: return KUNLUN_FMT_F32;
+        default:            return KUNLUN_FMT_NONE;
+    }
+}
+
+// a device-to-device weight copy carries its format with the bytes; the copy gets
+// its own maxptr so free_buffer never double-frees a shared scale
+// caller must hold g_kunlun_mutex
+static void kunlun_mirror_entry(const ggml_tensor * src, ggml_tensor * dst) {
+    const kunlun_weight_entry * src_entry = kunlun_weight_lookup(src);
+    if (src_entry == nullptr) {
+        return;
+    }
+    kunlun_weight_entry dst_entry = *src_entry;
+    dst_entry.src_type = dst->type;
+    dst_entry.n        = ggml_nelements(dst);
+    if (dst_entry.maxptr_dev != nullptr) {
+        float * maxptr = nullptr;
+        if (xpu_malloc((void **) &maxptr, sizeof(float)) == 0) {
+            xpu_wait();
+            maxptr[0] = dst_entry.max_abs;
+            xpu_wait();
+        } else {
+            maxptr = nullptr;
+        }
+        dst_entry.maxptr_dev = maxptr;
+    }
+    g_kunlun_weights[dst->data] = dst_entry;
 }
 
 // convert a full quantized payload to int8 + H2D; caller holds g_kunlun_mutex
@@ -122,12 +158,28 @@ static bool kunlun_upload_converted(ggml_tensor * tensor, const void * data) {
                       __func__, tensor->name, (long long) n, (double) scale, (double) max_abs, (double) max_err);
     }
 
+    // fc reads w_maxptr as a device float holding max_abs; KL1 device memory is
+    // host-mapped but we still go through xpu_memcpy to keep the DMA path explicit
+    float * maxptr_dev = nullptr;
+    if (xpu_malloc((void **) &maxptr_dev, sizeof(float)) != 0) {
+        GGML_LOG_ERROR("%s: maxptr alloc failed (%s)\n", __func__, tensor->name);
+        return false;
+    }
+    xpu_wait();
+    if (xpu_memcpy(maxptr_dev, &max_abs, sizeof(float), XPU_HOST_TO_DEVICE) != 0) {
+        xpu_free(maxptr_dev);
+        GGML_LOG_ERROR("%s: maxptr H2D failed (%s)\n", __func__, tensor->name);
+        return false;
+    }
+    xpu_wait();
+
     g_kunlun_weights[tensor->data] = kunlun_weight_entry{
-        /* .fmt      = */ KUNLUN_FMT_INT8,
-        /* .src_type = */ tensor->type,
-        /* .max_abs  = */ max_abs,
-        /* .scale    = */ scale,
-        /* .n        = */ n,
+        /* .fmt        = */ KUNLUN_FMT_INT8,
+        /* .src_type   = */ tensor->type,
+        /* .max_abs    = */ max_abs,
+        /* .scale      = */ scale,
+        /* .n          = */ n,
+        /* .maxptr_dev = */ maxptr_dev,
     };
     return true;
 }
@@ -139,7 +191,6 @@ static bool ggml_backend_buffer_is_kunlun(const struct ggml_tensor * tensor) {
            tensor->buffer->buft->device->reg == ggml_backend_kunlun_reg();
 }
 
-// ---------------------------------------------------------------------------
 // global device state
 
 struct ggml_backend_kunlun_device_context {
@@ -156,6 +207,7 @@ static std::vector<ggml_backend_buffer_type> g_kunlun_buft;
 static std::once_flag                        g_kunlun_init_flag;
 static int                                   g_kunlun_n_dev = 0;
 
+// ---------------------------------------------------------------------------
 // serializes all device calls: xpu_set_device is thread-local
 static std::mutex                            g_kunlun_mutex;
 
@@ -300,6 +352,9 @@ static void ggml_backend_kunlun_buffer_free_buffer(ggml_backend_buffer_t buffer)
     for (auto it = g_kunlun_weights.begin(); it != g_kunlun_weights.end();) {
         char * p = (char *) it->first;
         if (p >= base && p < base + buffer->size) {
+            if (it->second.maxptr_dev) {
+                xpu_free(it->second.maxptr_dev);
+            }
             it = g_kunlun_weights.erase(it);
         } else {
             ++it;
@@ -364,12 +419,17 @@ static void ggml_backend_kunlun_buffer_set_tensor(ggml_backend_buffer_t buffer, 
     }
     if (offset == 0 && size == ggml_nbytes(tensor)) {
         enum kunlun_tensor_fmt fmt = tensor->type == GGML_TYPE_F16 ? KUNLUN_FMT_F16 : KUNLUN_FMT_F32;
+        const kunlun_weight_entry * old = kunlun_weight_lookup(tensor);
+        if (old && old->maxptr_dev) {
+            xpu_free(old->maxptr_dev);
+        }
         g_kunlun_weights[tensor->data] = kunlun_weight_entry{
-            /* .fmt      = */ fmt,
-            /* .src_type = */ tensor->type,
-            /* .max_abs  = */ 0.0f,
-            /* .scale    = */ 0.0f,
-            /* .n        = */ ggml_nelements(tensor),
+            /* .fmt        = */ fmt,
+            /* .src_type   = */ tensor->type,
+            /* .max_abs    = */ 0.0f,
+            /* .scale      = */ 0.0f,
+            /* .n          = */ ggml_nelements(tensor),
+            /* .maxptr_dev = */ nullptr,
         };
     }
 }
@@ -460,13 +520,7 @@ static bool ggml_backend_kunlun_buffer_cpy_tensor(ggml_backend_buffer_t buffer,
         xpu_wait();
         if (rc == 0) {
             // format travels with the bytes: mirror the src registry entry onto dst
-            const kunlun_weight_entry * src_entry = kunlun_weight_lookup(src);
-            if (src_entry) {
-                kunlun_weight_entry dst_entry = *src_entry;
-                dst_entry.src_type = dst->type;
-                dst_entry.n        = ggml_nelements(dst);
-                g_kunlun_weights[dst->data] = dst_entry;
-            }
+            kunlun_mirror_entry(src, dst);
             return true;
         }
         return false;
@@ -503,13 +557,234 @@ static void ggml_backend_kunlun_free(ggml_backend_t backend) {
     delete backend;  // device contexts are static
 }
 
+// ---------------------------------------------------------------------------
+// ops
+
+// fc computes y[m,n] = x[m,k] * w[n,k]^T. ggml weight tensors are [k,n] row-major,
+// which is exactly the [n,k] matrix fc reads with w_trans=true.
+// caller must hold g_kunlun_mutex
+static enum ggml_status ggml_backend_kunlun_mul_mat(ggml_backend_t backend, ggml_tensor * node) {
+    ggml_backend_kunlun_device_context * dev =
+        (ggml_backend_kunlun_device_context *) backend->device->context;
+
+    const ggml_tensor * a = node->src[0];  // weights, ne = [k, n]
+    const ggml_tensor * b = node->src[1];  // activations, ne = [k, m]
+
+    const kunlun_weight_entry * w = kunlun_weight_lookup(a);
+    enum kunlun_tensor_fmt w_fmt = (w && w->fmt == KUNLUN_FMT_INT8)
+                                   ? KUNLUN_FMT_INT8
+                                   : kunlun_fmt_from_type(a->type);
+
+    int rc = kunlun_ops_mul_mat(dev->device, b->data, a->data, node->data,
+                                b->ne[1], a->ne[1], a->ne[0],
+                                w_fmt, w ? w->maxptr_dev : nullptr,
+                                b->type, node->type);
+    if (rc != 0) {
+        GGML_LOG_ERROR("%s: fc rc=%d (m=%lld n=%lld k=%lld, %s %s)\n",
+                       __func__, rc, (long long) b->ne[1], (long long) a->ne[1],
+                       (long long) a->ne[0], a->name, ggml_type_name(a->type));
+        return GGML_STATUS_FAILED;
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
+// read ne elements of a device tensor into host fp32, honoring the int8 registry
+// caller must hold g_kunlun_mutex
+static bool kunlun_read_f32(const ggml_tensor * tensor, std::vector<float> & out) {
+    const int64_t n = ggml_nelements(tensor);
+    out.resize(n);
+
+    const kunlun_weight_entry * e = kunlun_weight_lookup(tensor);
+    if (e && e->fmt == KUNLUN_FMT_INT8) {
+        std::vector<int8_t> q8(n);
+        if (xpu_memcpy(q8.data(), tensor->data, kunlun_int8_payload_size(tensor), XPU_DEVICE_TO_HOST) != 0) {
+            return false;
+        }
+        xpu_wait();
+        for (int64_t i = 0; i < n; i++) {
+            out[i] = (float) q8[i] * e->scale;
+        }
+        return true;
+    }
+
+    if (tensor->type == GGML_TYPE_F32) {
+        return xpu_memcpy(out.data(), tensor->data, n * sizeof(float), XPU_DEVICE_TO_HOST) == 0 &&
+               (xpu_wait(), true);
+    }
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> f16(n);
+        if (xpu_memcpy(f16.data(), tensor->data, n * sizeof(ggml_fp16_t), XPU_DEVICE_TO_HOST) != 0) {
+            return false;
+        }
+        xpu_wait();
+        for (int64_t i = 0; i < n; i++) {
+            out[i] = ggml_fp16_to_fp32(f16[i]);
+        }
+        return true;
+    }
+    GGML_LOG_ERROR("%s: cannot read device tensor %s of type %s\n",
+                   __func__, tensor->name, ggml_type_name(tensor->type));
+    return false;
+}
+
+// write host fp32 values into device memory of a tensor's ggml type
+// caller must hold g_kunlun_mutex
+static bool kunlun_write_f32(const ggml_tensor * tensor, void * dst, const float * src, int64_t n) {
+    if (tensor->type == GGML_TYPE_F32) {
+        return xpu_memcpy(dst, src, n * sizeof(float), XPU_HOST_TO_DEVICE) == 0 &&
+               (xpu_wait(), true);
+    }
+    if (tensor->type == GGML_TYPE_F16) {
+        std::vector<ggml_fp16_t> f16(n);
+        for (int64_t i = 0; i < n; i++) {
+            f16[i] = ggml_fp32_to_fp16(src[i]);
+        }
+        return xpu_memcpy(dst, f16.data(), n * sizeof(ggml_fp16_t), XPU_HOST_TO_DEVICE) == 0 &&
+               (xpu_wait(), true);
+    }
+    GGML_LOG_ERROR("%s: writing into %s of type %s unsupported\n",
+                   __func__, tensor->name, ggml_type_name(tensor->type));
+    return false;
+}
+
+// KV append: dst = cache (this node), src0 = row values, src1 = row indices.
+// Mirrors ggml_compute_forward_set_rows_impl: cache is [nc, ne1, ne02, ne03],
+// idx is [ne11, ne12], the row for (i, i02, i03) is read from idx at
+// (i, i02 % ne11, i03 % ne12). caller must hold g_kunlun_mutex
+static enum ggml_status ggml_backend_kunlun_set_rows(ggml_backend_t backend, ggml_tensor * node) {
+    ggml_backend_kunlun_device_context * dev =
+        (ggml_backend_kunlun_device_context *) backend->device->context;
+
+    ggml_tensor * cache = node;
+    const ggml_tensor * src0 = node->src[0];
+    const ggml_tensor * src1 = node->src[1];
+
+    if (!ggml_backend_buffer_is_kunlun(cache)) {
+        GGML_LOG_ERROR("%s: SET_ROWS cache is not a device tensor\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+    if (!src0 || !src1 ||
+        (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16) ||
+        (src1->type != GGML_TYPE_I32 && src1->type != GGML_TYPE_I64)) {
+        GGML_LOG_ERROR("%s: SET_ROWS contract violated (values %s, idx %s)\n",
+                       __func__, src0 ? ggml_type_name(src0->type) : "NULL",
+                       src1 ? ggml_type_name(src1->type) : "NULL");
+        return GGML_STATUS_FAILED;
+    }
+    if (cache->ne[0] != src0->ne[0] || cache->ne[2] % src1->ne[1] != 0 || cache->ne[3] % src1->ne[2] != 0) {
+        GGML_LOG_ERROR("%s: SET_ROWS shape mismatch\n", __func__);
+        return GGML_STATUS_FAILED;
+    }
+
+    xpu_set_device(dev->device);
+
+    const int64_t nc = cache->ne[0];
+    const int64_t nr = src0->ne[1];
+    const int64_t n_idx = ggml_nelements(src1);
+
+    std::vector<int64_t> idx(n_idx);
+    if (src1->type == GGML_TYPE_I64) {
+        if (ggml_backend_buffer_is_kunlun(src1)) {
+            if (xpu_memcpy(idx.data(), src1->data, n_idx * sizeof(int64_t), XPU_DEVICE_TO_HOST) != 0) {
+                GGML_LOG_ERROR("%s: SET_ROWS idx D2H failed\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+            xpu_wait();
+        } else {
+            memcpy(idx.data(), src1->data, n_idx * sizeof(int64_t));
+        }
+    } else {
+        std::vector<int32_t> idx32(n_idx);
+        if (ggml_backend_buffer_is_kunlun(src1)) {
+            if (xpu_memcpy(idx32.data(), src1->data, n_idx * sizeof(int32_t), XPU_DEVICE_TO_HOST) != 0) {
+                GGML_LOG_ERROR("%s: SET_ROWS idx D2H failed\n", __func__);
+                return GGML_STATUS_FAILED;
+            }
+            xpu_wait();
+        } else {
+            memcpy(idx32.data(), src1->data, n_idx * sizeof(int32_t));
+        }
+        for (int64_t i = 0; i < n_idx; i++) {
+            idx[i] = idx32[i];
+        }
+    }
+
+    std::vector<float> row(nc);
+    const size_t row_bytes = ggml_row_size(src0->type, nc);
+
+    for (int64_t i03 = 0; i03 < cache->ne[3]; i03++) {
+        for (int64_t i02 = 0; i02 < cache->ne[2]; i02++) {
+            for (int64_t i = 0; i < nr; i++) {
+                const int64_t i1 = idx[i +
+                    (i02 % src1->ne[1]) * src1->ne[0] +
+                    (i03 % src1->ne[2]) * src1->ne[0] * src1->ne[1]];
+                if (i1 < 0 || i1 >= cache->ne[1]) {
+                    GGML_LOG_ERROR("%s: SET_ROWS index %lld out of range %lld\n",
+                                   __func__, (long long) i1, (long long) cache->ne[1]);
+                    return GGML_STATUS_FAILED;
+                }
+
+                const char * src_ptr = (const char *) src0->data +
+                    i * src0->nb[1] + i02 * src0->nb[2] + i03 * src0->nb[3];
+                if (ggml_backend_buffer_is_kunlun(src0)) {
+                    std::vector<char> stage(row_bytes);
+                    if (xpu_memcpy(stage.data(), src_ptr, row_bytes, XPU_DEVICE_TO_HOST) != 0) {
+                        GGML_LOG_ERROR("%s: SET_ROWS row D2H failed\n", __func__);
+                        return GGML_STATUS_FAILED;
+                    }
+                    xpu_wait();
+                    src_ptr = stage.data();
+                }
+                if (src0->type == GGML_TYPE_F32) {
+                    memcpy(row.data(), src_ptr, nc * sizeof(float));
+                } else {
+                    const ggml_fp16_t * f16 = (const ggml_fp16_t *) src_ptr;
+                    for (int64_t j = 0; j < nc; j++) {
+                        row[j] = ggml_fp16_to_fp32(f16[j]);
+                    }
+                }
+
+                char * dst_ptr = (char *) cache->data + i1 * cache->nb[1] + i02 * cache->nb[2] + i03 * cache->nb[3];
+                if (!kunlun_write_f32(cache, dst_ptr, row.data(), nc)) {
+                    GGML_LOG_ERROR("%s: SET_ROWS row H2D failed\n", __func__);
+                    return GGML_STATUS_FAILED;
+                }
+            }
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_kunlun_device_context * ctx =
         (ggml_backend_kunlun_device_context *) backend->device->context;
 
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
+
+        // fc rejects m=0 with rc=1; views/reshapes carry no compute
+        if (ggml_is_empty(node) || node->op == GGML_OP_NONE || node->op == GGML_OP_RESHAPE ||
+            node->op == GGML_OP_VIEW || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE) {
+            if (ggml_is_empty(node)) {
+                GGML_LOG_DEBUG("%s: empty node '%s' (%s) skipped\n",
+                               __func__, node->name, ggml_op_name(node->op));
+            }
+            continue;
+        }
+
+        std::lock_guard<std::mutex> lock(g_kunlun_mutex);
+
         switch (node->op) {
+            case GGML_OP_MUL_MAT:
+                if (ggml_backend_kunlun_mul_mat(backend, node) != GGML_STATUS_SUCCESS) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
+            case GGML_OP_SET_ROWS:
+                if (ggml_backend_kunlun_set_rows(backend, node) != GGML_STATUS_SUCCESS) {
+                    return GGML_STATUS_FAILED;
+                }
+                break;
             case GGML_OP_CPY:
             case GGML_OP_CONT:
                 {
@@ -521,9 +796,21 @@ static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend
                         GGML_LOG_ERROR("%s: CPY with non-device tensor\n", __func__);
                         return GGML_STATUS_FAILED;
                     }
+
+                    if (src->type != dst->type) {
+                        // ggml uses CPY for casts; go through a host fp32 staging buffer
+                        std::vector<float> host;
+                        if (!kunlun_read_f32(src, host) ||
+                            !kunlun_write_f32(dst, dst->data, host.data(), (int64_t) host.size())) {
+                            GGML_LOG_ERROR("%s: CPY conversion %s -> %s failed\n",
+                                          __func__, ggml_type_name(src->type), ggml_type_name(dst->type));
+                            return GGML_STATUS_FAILED;
+                        }
+                        break;
+                    }
+
                     kunlun_buffer_ctx * src_ctx = (kunlun_buffer_ctx *) src->buffer->context;
                     kunlun_buffer_ctx * dst_ctx = (kunlun_buffer_ctx *) dst->buffer->context;
-                    std::lock_guard<std::mutex> lock(g_kunlun_mutex);
                     int rc;
                     if (src_ctx->device == dst_ctx->device) {
                         xpu_set_device(ctx->device);
@@ -540,13 +827,7 @@ static enum ggml_status ggml_backend_kunlun_graph_compute(ggml_backend_t backend
                         GGML_LOG_ERROR("%s: CPY rc=%d\n", __func__, rc);
                         return GGML_STATUS_FAILED;
                     }
-                    const kunlun_weight_entry * src_entry = kunlun_weight_lookup(src);
-                    if (src_entry) {
-                        kunlun_weight_entry dst_entry = *src_entry;
-                        dst_entry.src_type = dst->type;
-                        dst_entry.n        = ggml_nelements(dst);
-                        g_kunlun_weights[dst->data] = dst_entry;
-                    }
+                    kunlun_mirror_entry(src, dst);
                 }
                 break;
             default:
@@ -668,6 +949,35 @@ static bool ggml_backend_kunlun_device_supports_op(ggml_backend_dev_t dev, const
         case GGML_OP_CPY:
         case GGML_OP_CONT:
             return ggml_backend_buffer_is_kunlun(op->src[0]) && ggml_backend_buffer_is_kunlun(op);
+        case GGML_OP_MUL_MAT:
+            {
+                const ggml_tensor * src0 = op->src[0];
+                const ggml_tensor * src1 = op->src[1];
+                if (!src0 || !src1) {
+                    return false;
+                }
+                if (src0->ne[0] != src1->ne[0]) {
+                    return false;
+                }
+                // fc is a plain 2D GEMM
+                if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+                    return false;
+                }
+                if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1)) {
+                    return false;
+                }
+                // buffers are null during the pre-allocation probe
+                if (src0->buffer && !ggml_backend_buffer_is_kunlun(src0)) {
+                    return false;
+                }
+                if (src1->buffer && !ggml_backend_buffer_is_kunlun(src1)) {
+                    return false;
+                }
+                if (kunlun_type_is_converted(src0->type)) {
+                    return true;  // requantized to int8 when uploaded
+                }
+                return src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_F32;
+            }
         case GGML_OP_SET_ROWS:
             // KV cache updates; accept on type contract only (works for the
             // pre-allocation probe where view buffers are NULL)

@@ -29,6 +29,7 @@ struct kunlun_weight_entry {
     float                  max_abs;    // per-tensor max |w| of the dequantized weights
     float                  scale;      // max_abs / 127, i.e. w ~= int8 * scale
     int64_t                n;          // ggml_nelements(tensor)
+    float *                maxptr_dev; // device float holding max_abs for fc w_maxptr
 };
 
 // true if the tensor type is converted to int8 at upload time
